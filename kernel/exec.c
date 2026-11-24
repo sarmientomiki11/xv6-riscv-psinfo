@@ -127,14 +127,17 @@ kexec(char *path, char **argv)
   for (last = s = path; *s; s++)
     if (*s == '/')
       last = s + 1;
-  safestrcpy(p->name, last, sizeof(p->name));
 
   // Commit to the user image.
   oldpagetable = p->pagetable;
   p->pagetable = pagetable;
+  acquire(&p->lock);
+  safestrcpy(p->name, last, sizeof(p->name));
   p->sz = sz;
+  release(&p->lock);
   p->trapframe->epc = elf.entry; // initial program counter = ulib.c:start()
   p->trapframe->sp = sp;         // initial stack pointer
+
   proc_freepagetable(oldpagetable, oldsz);
 
   return argc; // this ends up in a0, the first argument to main(argc, argv)
@@ -174,3 +177,4 @@ loadseg(pagetable_t pagetable, uint64 va, struct inode *ip, uint offset,
 
   return 0;
 }
+
