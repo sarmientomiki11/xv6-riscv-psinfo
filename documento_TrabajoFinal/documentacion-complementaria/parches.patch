@@ -1,0 +1,545 @@
+diff --git a/Makefile b/Makefile
+index af1e7a5..72fa599 100644
+--- a/Makefile
++++ b/Makefile
+@@ -131,4 +131,6 @@ mkfs/mkfs: mkfs/mkfs.c $K/fs.h $K/param.h
+ 
+ UPROGS=\
++	$U/_psinfo\
++	$U/_psinfotest\
+ 	$U/_cat\
+ 	$U/_echo\
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 0ae6896..cde4414 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -80,4 +80,5 @@ void            printkinit(void);
+ 
+ // proc.c
++int             getpsinfo(uint64, int);
+ int             cpuid(void);
+ void            kexit(int);
+diff --git a/kernel/exec.c b/kernel/exec.c
+index 8c9673f..e37fd2a 100644
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -128,10 +128,12 @@ kexec(char *path, char **argv)
+     if (*s == '/')
+       last = s + 1;
+-  safestrcpy(p->name, last, sizeof(p->name));
+ 
+   // Commit to the user image.
+   oldpagetable = p->pagetable;
+   p->pagetable = pagetable;
++  acquire(&p->lock);
++  safestrcpy(p->name, last, sizeof(p->name));
+   p->sz = sz;
++  release(&p->lock);
+   p->trapframe->epc = elf.entry; // initial program counter = ulib.c:start()
+
+
+  p->trapframe->sp = sp;         // initial stack pointer
+diff --git a/kernel/proc.c b/kernel/proc.c
+index f4c1668..5f51bbd 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -6,4 +6,5 @@
+ #include "proc.h"
+ #include "defs.h"
++#include "psinfo.h"
+ 
+ struct cpu cpus[NCPU];
+@@ -250,5 +251,7 @@ growproc(int n)
+     sz = uvmdealloc(p->pagetable, sz, sz + n);
+   }
++  acquire(&p->lock);
+   p->sz = sz;
++  release(&p->lock);
+   return 0;
+ }
+@@ -669,4 +672,63 @@ either_copyin(void *dst, int user_src, uint64 src, uint64 len)
+ }
+ 
++
++// Copy one coherent process row at a time.
++static int
++ps_collect(struct psinfo *rows, int cap)
++{
++  int n = 0;
++
++  for (struct proc *p = proc; p < &proc[NPROC] && n < cap; p++) {
++    int state = 0;
++    acquire(&wait_lock);
++    acquire(&p->lock);
++    switch (p->state) {
++    case SLEEPING: state = PS_SLEEPING; break;
++    case RUNNABLE: state = PS_RUNNABLE; break;
++    case RUNNING:  state = PS_RUNNING;  break;
++    case ZOMBIE:   state = PS_ZOMBIE;   break;
++    default:      break;
++    }
+
+
++    if (state != 0) {
++      struct psinfo *row = &rows[n++];
++      row->pid = p->pid;
++      row->ppid = p->parent ? p->parent->pid : 0;
++      row->state = state;
++      row->vbytes = p->sz;
++      safestrcpy(row->name, p->name, sizeof(row->name));
++    }
++    release(&p->lock);
++    release(&wait_lock);
++  }
++  return n;
++}
++
++int
++getpsinfo(uint64 dst, int cap)
++{
++  struct proc *self = myproc();
++  struct psinfo *rows;
++  uint64 len;
++  int n, result;
++
++  if (dst == 0 || cap <= 0 || cap > NPROC)
++    return -1;
++  len = (uint64)cap * sizeof(*rows);
++  if (dst > self->sz || len > self->sz - dst)
++    return -1;
++
++  _Static_assert(NPROC * sizeof(*rows) <= PGSIZE,
++                 "psinfo buffer must fit in one page");
++  rows = (struct psinfo *)kalloc();
++  if (rows == 0)
++    return -1;
++  memset(rows, 0, len);
++  n = ps_collect(rows, cap);
++  result = copyout(self->pagetable, self->sz, dst,
++                   (char *)rows, n * sizeof(*rows)) < 0 ? -1 : n;
++  kfree(rows);
++  return result;
++}
+
+
++
+ // Print a process listing to console.  For debugging.
+ // Runs when user types ^P on console.
+diff --git a/kernel/proc.h b/kernel/proc.h
+index 5603697..985e56f 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -93,7 +93,11 @@ struct proc {
+   struct proc *parent; // Parent process
+ 
++  // Writers and external observers of sz and name hold p->lock.
++  // The running process can read its own fields directly.
++  uint64 sz;                   // Virtual size (bytes)
++  char name[16];               // Process name
++
+   // these are private to the process, so p->lock need not be held.
+   uint64 kstack;               // Virtual address of kernel stack
+-  uint64 sz;                   // Size of process memory (bytes)
+   pagetable_t pagetable;       // User page table
+   struct trapframe *trapframe; // data page for trampoline.S
+@@ -101,4 +105,3 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+-  char name[16];               // Process name (debugging)
+ };
+diff --git a/kernel/psinfo.h b/kernel/psinfo.h
+new file mode 100644
+index 0000000..0c52681
+--- /dev/null
++++ b/kernel/psinfo.h
+@@ -0,0 +1,23 @@
++#ifndef XV6_PSINFO_H
++#define XV6_PSINFO_H
++
++#define PS_NAME_LEN 16
++enum ps_state {
++  PS_SLEEPING = 1,
++  PS_RUNNABLE,
++  PS_RUNNING,
++  PS_ZOMBIE
++};
+
+
++
++struct psinfo {
++  int pid;
++  int ppid;
++  int state;
++  uint32 reserved;
++  uint64 vbytes;
++  char name[PS_NAME_LEN];
++};
++
++typedef char psinfo_size_check[sizeof(struct psinfo) == 40 ? 1 : -1];
++
++#endif
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 1800f20..4c6d31d 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -104,4 +104,5 @@ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
+ extern uint64 sys_sync(void);
++extern uint64 sys_getpsinfo(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+@@ -131,4 +132,5 @@ static uint64 (*syscalls[])(void) = {
+   [SYS_close]   = sys_close,
+   [SYS_sync]    = sys_sync,
++  [SYS_getpsinfo] = sys_getpsinfo,
+   // clang-format on
+ };
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 5a4a39f..09536f6 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -22,2 +22,3 @@
+ #define SYS_close  21
+ #define SYS_sync   22
++#define SYS_getpsinfo 28
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index cd25557..8de656f 100644
+--- a/kernel/sysproc.c
+
+
++++ b/kernel/sysproc.c
+@@ -46,5 +46,6 @@ sys_sbrk(void)
+   argint(0, &n);
+   argint(1, &t);
+-  addr = myproc()->sz;
++  struct proc *p = myproc();
++  addr = p->sz;
+ 
+   if (t == SBRK_EAGER || n < 0) {
+@@ -60,5 +61,7 @@ sys_sbrk(void)
+     if (addr + n > TRAPFRAME)
+       return -1;
+-    myproc()->sz += n;
++    acquire(&p->lock);
++    p->sz = addr + n;
++    release(&p->lock);
+   }
+   return addr;
+@@ -111,2 +114,13 @@ sys_uptime(void)
+   return xticks;
+ }
++
++uint64
++sys_getpsinfo(void)
++{
++  uint64 dst;
++  int cap;
++
++  argaddr(0, &dst);
++  argint(1, &cap);
++  return getpsinfo(dst, cap);
++}
+diff --git a/user/psinfo.c b/user/psinfo.c
+new file mode 100644
+index 0000000..c7f41b4
+--- /dev/null
++++ b/user/psinfo.c
+@@ -0,0 +1,41 @@
++#include "kernel/types.h"
++#include "kernel/param.h"
+
++#include "kernel/psinfo.h"
++#include "user/user.h"
++
++static struct psinfo rows[NPROC];
++
++static const char *
++state_name(int state)
++{
++  switch (state) {
++  case PS_SLEEPING: return "SLEEPING";
++  case PS_RUNNABLE: return "RUNNABLE";
++  case PS_RUNNING:  return "RUNNING";
++  case PS_ZOMBIE:   return "ZOMBIE";
++  default:          return "UNKNOWN";
++  }
++}
++
++int
++main(int argc, char **argv)
++{
++  if (argc != 1) {
++    fprintf(2, "uso: %s\n", argv[0]);
++    exit(2);
++  }
++
++  int n = getpsinfo(rows, NPROC);
++  if (n < 0) {
++    fprintf(2, "psinfo: consulta fallida\n");
++    exit(1);
++  }
++
++  printf("PID\tPPID\tESTADO\tVIRT_B\tNOMBRE\n");
++  for (int i = 0; i < n; i++) {
++    const struct psinfo *r = &rows[i];
++    printf("%d\t%d\t%s\t%lu\t%s\n", r->pid, r->ppid,
++           state_name(r->state), r->vbytes, r->name);
++  }
++  exit(0);
++}
+diff --git a/user/psinfotest.c b/user/psinfotest.c
+new file mode 100644
+
+
+index 0000000..bb7b42a
+--- /dev/null
++++ b/user/psinfotest.c
+@@ -0,0 +1,214 @@
++#include "kernel/types.h"
++#include "kernel/param.h"
++#include "kernel/riscv.h"
++#include "kernel/psinfo.h"
++#include "user/user.h"
++
++static struct psinfo rows[NPROC];
++static int failures;
++
++static int
++find_pid(int pid)
++{
++  int n = getpsinfo(rows, NPROC);
++  if (n < 0)
++    return -2;
++  for (int i = 0; i < n; i++)
++    if (rows[i].pid == pid)
++      return i;
++  return -1;
++}
++
++static void
++check(const char *id, int ok)
++{
++  printf("%s %s\n", id, ok ? "PASS" : "FAIL");
++  if (!ok)
++    failures++;
++}
++
++static int
++valid(void)
++{
++  int n = getpsinfo(rows, NPROC);
++  int own = 0;
++  if (n <= 0 || n > NPROC)
++    return 0;
+
+
++  for (int i = 0; i < n; i++) {
++    struct psinfo *r = &rows[i];
++    if (r->pid <= 0 || r->ppid < 0 || r->reserved ||
++        r->state < PS_SLEEPING || r->state > PS_ZOMBIE ||
++        r->name[PS_NAME_LEN - 1] != 0)
++      return 0;
++    for (int j = 0; j < i; j++)
++      if (rows[j].pid == r->pid)
++        return 0;
++    if (r->pid == getpid())
++      own = r->state == PS_RUNNING &&
++            strcmp(r->name, "psinfotest") == 0 && r->vbytes > 0;
++  }
++  return own;
++}
++
++static int
++bounds(void)
++{
++  struct psinfo one[2];
++  memset(one, 0, sizeof(one));
++  one[1].pid = 123456;
++  int n = getpsinfo(one, 1);
++  return n == 1 && one[0].pid > 0 && one[1].pid == 123456 &&
++         getpsinfo(one, 0) == -1 &&
++         getpsinfo(one, -1) == -1 &&
++         getpsinfo(one, NPROC + 1) == -1;
++}
++
++static int
++bad_address(void)
++{
++  return getpsinfo(0, 1) == -1 &&
++         getpsinfo((struct psinfo *)~0ULL, 1) == -1 &&
++         getpsinfo((struct psinfo *)(sbrk(0) - 1), 1) == -1 &&
++         getpsinfo((struct psinfo *)(uint64)&bad_address, 1) == -1 &&
++         valid();
++}
++
++static void
+
+
++lifecycle(void)
++{
++  int fd[2], status = -1;
++  if (pipe(fd) < 0) {
++    check("T04", 0);
++    check("T05", 0);
++    return;
++  }
++
++  int child = fork();
++  if (child == 0) {
++    char token;
++    close(fd[1]);
++    int n = read(fd[0], &token, 1);
++    close(fd[0]);
++    exit(n == 0 ? 0 : 1);
++  }
++
++  close(fd[0]);
++  int sleeping = 0, zombie = 0;
++  if (child > 0) {
++    for (int k = 0; k < 20; k++) {
++      int i = find_pid(child);
++      if (i >= 0 && rows[i].state == PS_SLEEPING &&
++          rows[i].ppid == getpid()) {
++        sleeping = 1;
++        printf("T04 hijo=%d padre=%d estado=SLEEPING\n",
++               child, rows[i].ppid);
++        break;
++      }
++      pause(1);
++    }
++  }
++  check("T04", sleeping);
++  close(fd[1]);
++
++  if (child > 0) {
++    for (int k = 0; k < 20; k++) {
++      int i = find_pid(child);
++      if (i >= 0 && rows[i].state == PS_ZOMBIE &&
++          rows[i].ppid == getpid()) {
+
++        zombie = 1;
++        break;
++      }
++      pause(1);
++    }
++  }
++  int reaped = child > 0 && wait(&status) == child && status == 0;
++  int absent = reaped && find_pid(child) == -1;
++  printf("T05 hijo=%d zombie=%d ausente=%d\n", child, zombie, absent);
++  check("T05", zombie && absent);
++}
++
++static void
++size_change(void)
++{
++  int pid = getpid();
++  int i = find_pid(pid);
++  if (i < 0) {
++    check("T06", 0);
++    return;
++  }
++  uint64 before = rows[i].vbytes;
++  char *space = sbrklazy(2 * PGSIZE);
++  if (space == SBRK_ERROR) {
++    check("T06", 0);
++    return;
++  }
++  i = find_pid(pid);
++  uint64 grown = i < 0 ? 0 : rows[i].vbytes;
++  int shrunk = sbrk(-2 * PGSIZE) != SBRK_ERROR;
++  i = find_pid(pid);
++  uint64 after = i < 0 ? 0 : rows[i].vbytes;
++  printf("T06 antes=%lu ampliado=%lu recuperado=%lu\n",
++         before, grown, after);
++  check("T06", grown == before + 2 * PGSIZE && shrunk &&
++               after == before);
++}
++
++static int
++stress(void)
+
+
++{
++  enum { CHILDREN = 3, ROUNDS = 100 };
++  int created = 0, completed = 0, own = valid();
++  for (int i = 0; i < CHILDREN; i++) {
++    int child = fork();
++    if (child == 0) {
++      for (int k = 0; k < ROUNDS; k++) {
++        char *space = sbrk(PGSIZE);
++        if (space == SBRK_ERROR || !valid() ||
++            sbrk(-PGSIZE) == SBRK_ERROR)
++          exit(1);
++      }
++      exit(0);
++    }
++    if (child > 0)
++      created++;
++  }
++  for (int k = 0; k < ROUNDS; k++)
++    if (!valid())
++      own = 0;
++  for (int i = 0; i < created; i++) {
++    int status = -1;
++    if (wait(&status) > 0 && status == 0)
++      completed++;
++  }
++  printf("T07 creados=%d finalizados=%d rondas=%d\n",
++         created, completed, ROUNDS);
++  return own && created == CHILDREN && completed == CHILDREN;
++}
++
++static int
++cross_page(void)
++{
++  char *raw = sbrk(3 * PGSIZE);
++  if (raw == SBRK_ERROR)
++    return 0;
++  uint64 boundary = PGROUNDUP((uint64)raw + 1);
++  struct psinfo *dst = (struct psinfo *)(boundary - 8);
++  int n = getpsinfo(dst, 1);
++  int ok = n == 1 && dst->pid > 0 &&
+
+
++           dst->name[PS_NAME_LEN - 1] == 0;
++  return sbrk(-3 * PGSIZE) != SBRK_ERROR && ok;
++}
++
++int
++main(void)
++{
++  check("T01", valid());
++  check("T02", bounds());
++  check("T03", bad_address());
++  lifecycle();
++  size_change();
++  check("T07", stress());
++  check("T08", cross_page());
++  printf("TOTAL %d/8 PASS\n", 8 - failures);
++  exit(failures != 0);
++}
+diff --git a/user/user.h b/user/user.h
+index 29aad59..d43f4fb 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -2,4 +2,5 @@
+ 
+ struct stat;
++struct psinfo;
+ 
+ // system calls
+@@ -26,4 +27,5 @@ int pause(int);
+ int uptime(void);
+ int sync(void);
++int getpsinfo(struct psinfo *, int);
+ 
+ // ulib.c
+diff --git a/user/usys.pl b/user/usys.pl
+index 4d054e8..e7ee856 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -44,2 +44,3 @@ entry("pause");
+ entry("uptime");
+ entry("sync");
++entry("getpsinfo");
+
