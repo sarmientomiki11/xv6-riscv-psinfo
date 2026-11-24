@@ -5,6 +5,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "psinfo.h"
 
 struct cpu cpus[NCPU];
 
@@ -249,8 +250,11 @@ growproc(int n)
   } else if (n < 0) {
     sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
+  acquire(&p->lock);
   p->sz = sz;
+  release(&p->lock);
   return 0;
+
 }
 
 // Create a new process, copying the parent.
@@ -670,8 +674,68 @@ either_copyin(void *dst, int user_src, uint64 src, uint64 len)
   }
 }
 
+
+// Copy one coherent process row at a time.
+static int
+ps_collect(struct psinfo *rows, int cap)
+{
+  int n = 0;
+
+  for (struct proc *p = proc; p < &proc[NPROC] && n < cap; p++) {
+    int state = 0;
+    acquire(&wait_lock);
+    acquire(&p->lock);
+    switch (p->state) {
+    case SLEEPING: state = PS_SLEEPING; break;
+    case RUNNABLE: state = PS_RUNNABLE; break;
+    case RUNNING:  state = PS_RUNNING;  break;
+    case ZOMBIE:   state = PS_ZOMBIE;   break;
+    default:      break;
+    }
+    if (state != 0) {
+      struct psinfo *row = &rows[n++];
+      row->pid = p->pid;
+      row->ppid = p->parent ? p->parent->pid : 0;
+      row->state = state;
+      row->vbytes = p->sz;
+      safestrcpy(row->name, p->name, sizeof(row->name));
+    }
+    release(&p->lock);
+    release(&wait_lock);
+  }
+  return n;
+}
+
+int
+getpsinfo(uint64 dst, int cap)
+{
+  struct proc *self = myproc();
+  struct psinfo *rows;
+  uint64 len;
+  int n, result;
+
+  if (dst == 0 || cap <= 0 || cap > NPROC)
+    return -1;
+  len = (uint64)cap * sizeof(*rows);
+  if (dst > self->sz || len > self->sz - dst)
+    return -1;
+
+  _Static_assert(NPROC * sizeof(*rows) <= PGSIZE,
+                 "psinfo buffer must fit in one page");
+  rows = (struct psinfo *)kalloc();
+  if (rows == 0)
+    return -1;
+  memset(rows, 0, len);
+  n = ps_collect(rows, cap);
+  result = copyout(self->pagetable, self->sz, dst,
+                   (char *)rows, n * sizeof(*rows)) < 0 ? -1 : n;
+  kfree(rows);
+  return result;
+}
+
 // Print a process listing to console.  For debugging.
 // Runs when user types ^P on console.
+
 // No lock to avoid wedging a stuck machine further.
 void
 procdump(void)
@@ -701,3 +765,4 @@ procdump(void)
     printk("\n");
   }
 }
+
