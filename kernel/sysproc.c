@@ -45,7 +45,9 @@ sys_sbrk(void)
 
   argint(0, &n);
   argint(1, &t);
-  addr = myproc()->sz;
+  struct proc *p = myproc();
+  addr = p->sz;
+
 
   if (t == SBRK_EAGER || n < 0) {
     if (growproc(n) < 0) {
@@ -59,9 +61,12 @@ sys_sbrk(void)
       return -1;
     if (addr + n > TRAPFRAME)
       return -1;
-    myproc()->sz += n;
+    acquire(&p->lock);
+    p->sz = addr + n;
+    release(&p->lock);
   }
   return addr;
+
 }
 
 uint64
@@ -110,3 +115,15 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+uint64
+sys_getpsinfo(void)
+{
+  uint64 dst;
+  int cap;
+
+  argaddr(0, &dst);
+  argint(1, &cap);
+  return getpsinfo(dst, cap);
+}
+
